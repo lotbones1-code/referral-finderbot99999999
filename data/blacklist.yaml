@@ -1,0 +1,7 @@
+domains:
+  - example.com
+users:
+  - AutoModerator
+subreddits:
+  - politics
+  - cryptoMoonShots

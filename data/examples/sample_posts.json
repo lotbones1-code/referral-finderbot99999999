@@ -1,0 +1,13 @@
+[
+  {
+    "id": "reddit_xyz",
+    "platform": "reddit",
+    "url": "https://www.reddit.com/r/browsers/comments/xyz",
+    "title": "Looking for a new browser focused on research",
+    "text": "I need something faster than Chrome with better AI tools.",
+    "author": "sample_user",
+    "score": 5,
+    "followers": null,
+    "created_ts": 1700000000.0
+  }
+]
