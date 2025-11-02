@@ -1,0 +1,516 @@
+# ===== ./core/matcher.py =====
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Iterable, List
+
+import yaml
+
+
+class IntentMatcher:
+    """Keyword-based intent matcher with blacklist filtering."""
+
+    def __init__(self, keywords_path: str, blacklist_path: str):
+        self.keywords_path = Path(keywords_path)
+        self.blacklist_path = Path(blacklist_path)
+        self.config = yaml.safe_load(self.keywords_path.read_text(encoding="utf-8")) or {}
+        self.blacklist = yaml.safe_load(self.blacklist_path.read_text(encoding="utf-8")) or {}
+        self.include_patterns = self._compile_patterns(self.config.get("include", []))
+        self.exclude_patterns = self._compile_patterns(self.config.get("exclude", []))
+
+    @staticmethod
+    def _compile_patterns(words: Iterable[str]) -> List[re.Pattern[str]]:
+        return [re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE) for word in words]
+
+    def match(self, text: str) -> bool:
+        if not text:
+            return False
+        for pattern in self.exclude_patterns:
+            if pattern.search(text):
+                return False
+        return any(pattern.search(text) for pattern in self.include_patterns)
+
+    def allowed(self, platform: str, author: str, url: str, **metadata: object) -> bool:
+        domains = set(self.blacklist.get("domains", []) or [])
+        users = set(self.blacklist.get("users", []) or [])
+        subreddits = set(self.blacklist.get("subreddits", []) or [])
+        if any(domain in (url or "") for domain in domains):
+            return False
+        if author and author in users:
+            return False
+        subreddit = (metadata.get("subreddit") or "").lower() if metadata else ""
+        if subreddit and subreddit in {s.lower() for s in subreddits}:
+            return False
+        return True
+
+
+# ===== ./core/models.py =====
+
+from __future__ import annotations
+
+from typing import Optional
+
+from pydantic import BaseModel, HttpUrl
+
+
+class Lead(BaseModel):
+    """Normalized representation of an opportunity to respond."""
+
+    id: str
+    platform: str
+    url: HttpUrl
+    title: str
+    text: str
+    author: str
+    score: Optional[int] = None
+    followers: Optional[int] = None
+    created_ts: float
+    draft: Optional[str] = None
+
+
+# ===== ./core/reply.py =====
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+TEMPLATES = {
+    "helpful": (
+        "Hey there — if you’re exploring {topic}, {brand} is worth a look. "
+        "It balances fast search with on-page automation (summaries, citations, actions). "
+        "Starter tip: open a few tabs and ask it to compare — it handles context well. "
+        "If you decide to try it, this link gives you the promo: {ref}\n(Disclosure: referral link.)"
+    ),
+    "automation": (
+        "For workflow automation in the browser, {brand} is solid: summarize the page, "
+        "extract bullets, draft a reply, then iterate. You can run it on any open tab. "
+        "Trial via my link: {ref}\n(Referral.)"
+    ),
+}
+
+
+@dataclass
+class ReplyBuilder:
+    brand: str
+    referral_link: str
+
+    def pick_topic(self, lead: dict) -> str:
+        text = ((lead.get("title") or "") + "\n" + (lead.get("text") or "")).lower()
+        if any(keyword in text for keyword in ("automation", "automate", "workflow")):
+            return "automation tools"
+        if any(keyword in text for keyword in ("arc", "chrome", "firefox")):
+            return "new browsers"
+        return "research browsers"
+
+    def build(self, lead: dict) -> str:
+        topic = self.pick_topic(lead)
+        template_key = "automation" if topic == "automation tools" else "helpful"
+        template = TEMPLATES[template_key]
+        return template.format(topic=topic, brand=self.brand, ref=self.referral_link).strip()
+
+
+# ===== ./core/storage.py =====
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import List, Mapping
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS leads(
+  id TEXT PRIMARY KEY,
+  platform TEXT,
+  url TEXT,
+  title TEXT,
+  text TEXT,
+  author TEXT,
+  score INTEGER,
+  followers INTEGER,
+  created_ts REAL,
+  draft TEXT
+)
+"""
+
+
+class DB:
+    """Simple SQLite-backed storage for leads and drafted replies."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.execute(SCHEMA)
+        self.conn.commit()
+
+    def upsert_lead(self, lead: Mapping[str, object]) -> bool:
+        """Insert a lead if it does not already exist.
+
+        Returns True if the lead was newly inserted.
+        """
+
+        placeholders = (
+            lead["id"],
+            lead["platform"],
+            lead["url"],
+            lead["title"],
+            lead["text"],
+            lead["author"],
+            lead.get("score"),
+            lead.get("followers"),
+            lead["created_ts"],
+            lead.get("draft"),
+        )
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO leads(
+                    id, platform, url, title, text, author,
+                    score, followers, created_ts, draft
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                placeholders,
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+        finally:
+            cur.close()
+
+    def fetch_all(self) -> List[Mapping[str, object]]:
+        cur = self.conn.execute(
+            "SELECT id, platform, url, title, text, author, score, followers, created_ts, draft FROM leads ORDER BY created_ts DESC"
+        )
+        columns = [c[0] for c in cur.description]
+        rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+        cur.close()
+        return rows
+
+    def fetch_undrafted(self, limit: int = 50) -> List[Mapping[str, object]]:
+        cur = self.conn.execute(
+            "SELECT id, platform, url, title, text, author, score, followers, created_ts FROM leads WHERE draft IS NULL ORDER BY created_ts DESC LIMIT ?",
+            (limit,),
+        )
+        columns = [c[0] for c in cur.description]
+        rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+        cur.close()
+        return rows
+
+    def attach_draft(self, lead_id: str, draft: str) -> None:
+        self.conn.execute("UPDATE leads SET draft = ? WHERE id = ?", (draft, lead_id))
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+# ===== ./main.py =====
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from rich import print
+
+from core.matcher import IntentMatcher
+from core.reply import ReplyBuilder
+from core.storage import DB
+from sources.reddit_client import RedditSource
+from sources.rss_client import RSSSource
+from sources.twitter_client import TwitterSource
+
+
+load_dotenv()
+
+
+def get_repo_path() -> Path:
+    """Return the project root path."""
+    return Path(__file__).resolve().parent
+
+
+def build_matcher() -> IntentMatcher:
+    root = get_repo_path()
+    keywords_path = root / "data" / "keywords.yaml"
+    blacklist_path = root / "data" / "blacklist.yaml"
+    return IntentMatcher(str(keywords_path), str(blacklist_path))
+
+
+def build_reply_builder() -> ReplyBuilder:
+    referral_link = os.getenv("REFERRAL_LINK", "")
+    brand_name = os.getenv("BRAND_NAME", "Perplexity Browser")
+    return ReplyBuilder(brand=brand_name, referral_link=referral_link)
+
+
+async def scan(sources: list[str], export: str | None = None) -> None:
+    db = DB("leads.db")
+    matcher = build_matcher()
+
+    providers = []
+    if "reddit" in sources:
+        providers.append(RedditSource(matcher=matcher))
+    if "twitter" in sources:
+        providers.append(TwitterSource(matcher=matcher))
+    if "rss" in sources:
+        providers.append(RSSSource(matcher=matcher))
+
+    total_new = 0
+    for provider in providers:
+        async for lead in provider.find_posts():
+            if db.upsert_lead(lead):
+                total_new += 1
+    print(f"[bold green]New leads:[/bold green] {total_new}")
+
+    if export:
+        rows = db.fetch_all()
+        export_path = Path(export)
+        with export_path.open("w", newline="", encoding="utf-8") as fh:
+            if rows:
+                writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            else:
+                fh.write("")
+        print(f"Exported {len(rows)} rows to {export_path}")
+
+
+async def draft(limit: int) -> None:
+    db = DB("leads.db")
+    reply_builder = build_reply_builder()
+    leads = db.fetch_undrafted(limit=limit)
+    for lead in leads:
+        draft_text = reply_builder.build(lead)
+        db.attach_draft(lead["id"], draft_text)
+        print(
+            f"\n[bold]Lead[/bold] {lead['platform']} | {lead['author']} | {lead['url']}\n"
+            f"{draft_text}\n"
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Referral Finder Bot CLI")
+    subparsers = parser.add_subparsers(dest="cmd", required=True)
+
+    scan_parser = subparsers.add_parser("scan", help="Scan platforms for new leads")
+    scan_parser.add_argument(
+        "--sources",
+        nargs="+",
+        default=["reddit", "rss"],
+        choices=["reddit", "twitter", "rss"],
+        help="Platforms to scan",
+    )
+    scan_parser.add_argument("--export", help="Optional path to export all leads as CSV")
+
+    draft_parser = subparsers.add_parser("draft", help="Draft replies for stored leads")
+    draft_parser.add_argument("--limit", type=int, default=20, help="Maximum drafts to generate")
+
+    args = parser.parse_args()
+
+    if args.cmd == "scan":
+        asyncio.run(scan(args.sources, args.export))
+    elif args.cmd == "draft":
+        asyncio.run(draft(args.limit))
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ===== ./sources/reddit_client.py =====
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from typing import AsyncGenerator
+
+import praw
+
+from core.models import Lead
+from core.matcher import IntentMatcher
+
+
+class RedditSource:
+    """Fetch matching Reddit submissions via PRAW search."""
+
+    def __init__(self, matcher: IntentMatcher):
+        self.matcher = matcher
+        self.reddit = praw.Reddit(
+            client_id=os.getenv("REDDIT_CLIENT_ID"),
+            client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+            user_agent=os.getenv("REDDIT_USER_AGENT", "referral-finder-bot/1.0"),
+        )
+        self.min_score = int(os.getenv("MIN_SCORE", "1"))
+        self.subreddits = [
+            "technology",
+            "browsers",
+            "Productivity",
+            "selfhosted",
+            "Automation",
+            "InternetIsBeautiful",
+        ]
+        self.query = "(\"new browser\" OR \"best browser\" OR automation OR \"AI agent\")"
+
+    async def find_posts(self) -> AsyncGenerator[dict, None]:
+        loop = asyncio.get_event_loop()
+        for subreddit in self.subreddits:
+            submissions = await loop.run_in_executor(
+                None,
+                lambda s=subreddit: list(
+                    self.reddit.subreddit(s).search(query=self.query, sort="new", limit=25)
+                ),
+            )
+            for post in submissions:
+                text = f"{post.title or ''}\n{post.selftext or ''}"
+                if not self.matcher.match(text):
+                    continue
+                if post.score is not None and int(post.score) < self.min_score:
+                    continue
+                if not self.matcher.allowed(
+                    "reddit",
+                    str(post.author or ""),
+                    post.url,
+                    subreddit=str(post.subreddit or ""),
+                ):
+                    continue
+                lead = Lead(
+                    id=f"reddit_{post.id}",
+                    platform="reddit",
+                    url=post.url,
+                    title=post.title or "",
+                    text=post.selftext or "",
+                    author=str(post.author or ""),
+                    score=int(post.score or 0),
+                    followers=None,
+                    created_ts=float(getattr(post, "created_utc", time.time())),
+                )
+                yield lead.model_dump()
+
+
+# ===== ./sources/rss_client.py =====
+
+from __future__ import annotations
+
+import re
+import time
+from typing import AsyncGenerator, Iterable
+
+import httpx
+
+from core.models import Lead
+from core.matcher import IntentMatcher
+
+
+FEEDS = [
+    "https://news.google.com/rss/search?q=\"new+browser\"+OR+\"best+browser\"+OR+automation+OR+\"AI+agent\"&hl=en-US&gl=US&ceid=US:en"
+]
+
+
+class RSSSource:
+    """Fetch articles from configured RSS feeds."""
+
+    def __init__(self, matcher: IntentMatcher, feeds: Iterable[str] | None = None):
+        self.matcher = matcher
+        self.feeds = list(feeds or FEEDS)
+
+    async def find_posts(self) -> AsyncGenerator[dict, None]:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for feed in self.feeds:
+                response = await client.get(feed)
+                if response.status_code != 200:
+                    continue
+                for item in re.finditer(r"<item>(.*?)</item>", response.text, flags=re.IGNORECASE | re.DOTALL):
+                    chunk = item.group(1)
+                    title_match = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", chunk)
+                    link_match = re.search(r"<link>(.*?)</link>", chunk)
+                    title = title_match.group(1) if title_match else ""
+                    link = link_match.group(1) if link_match else ""
+                    if not self.matcher.match(title):
+                        continue
+                    lead = Lead(
+                        id=f"rss_{hash(link)}",
+                        platform="rss",
+                        url=link,
+                        title=title,
+                        text=title,
+                        author="rss",
+                        score=None,
+                        followers=None,
+                        created_ts=time.time(),
+                    )
+                    yield lead.model_dump()
+
+
+# ===== ./sources/twitter_client.py =====
+
+from __future__ import annotations
+
+import os
+import time
+from typing import AsyncGenerator
+
+import httpx
+
+from core.models import Lead
+from core.matcher import IntentMatcher
+
+
+class TwitterSource:
+    """Fetch recent tweets that match keywords using the Twitter API v2."""
+
+    def __init__(self, matcher: IntentMatcher):
+        self.matcher = matcher
+        self.bearer = os.getenv("TWITTER_BEARER_TOKEN")
+        self.min_followers = int(os.getenv("MIN_FOLLOWERS", "25"))
+
+    async def find_posts(self) -> AsyncGenerator[dict, None]:
+        if not self.bearer:
+            return
+
+        query = '"new browser" OR "best browser" OR automation OR "AI agent" lang:en -is:retweet'
+        params = {
+            "query": query,
+            "tweet.fields": "author_id,created_at,public_metrics",
+            "expansions": "author_id",
+            "user.fields": "public_metrics,username",
+            "max_results": 50,
+        }
+        url = "https://api.twitter.com/2/tweets/search/recent"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(url, params=params, headers={"Authorization": f"Bearer {self.bearer}"})
+            if response.status_code != 200:
+                return
+            payload = response.json()
+            users = {user["id"]: user for user in payload.get("includes", {}).get("users", [])}
+            for tweet in payload.get("data", []):
+                user = users.get(tweet["author_id"], {})
+                text = tweet.get("text", "")
+                if not self.matcher.match(text):
+                    continue
+                followers = user.get("public_metrics", {}).get("followers_count", 0)
+                if followers < self.min_followers:
+                    continue
+                url = f"https://twitter.com/{user.get('username', '')}/status/{tweet['id']}"
+                lead = Lead(
+                    id=f"twitter_{tweet['id']}",
+                    platform="twitter",
+                    url=url,
+                    title=text[:120],
+                    text=text,
+                    author=user.get("username", ""),
+                    score=tweet.get("public_metrics", {}).get("like_count", 0),
+                    followers=followers,
+                    created_ts=time.time(),
+                )
+                yield lead.model_dump()
+
+
